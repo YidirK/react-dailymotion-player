@@ -1,4 +1,6 @@
 const API_BASE = 'https://api.dailymotion.com'
+const MAX_LIMIT = 100 // plafond de l'API Dailymotion
+const MAX_CACHE_ENTRIES = 200
 
 export const DEFAULT_VIDEO_FIELDS = [
   'id',
@@ -39,16 +41,16 @@ export interface VideosPage {
 }
 
 export type DailymotionVideoSort =
-  | 'visited'
-  | 'visited-today'
-  | 'visited-week'
-  | 'visited-month'
-  | 'recent'
-  | 'trending'
-  | 'relevance'
-  | 'ranking'
-  | 'random'
-  | (string & {})
+    | 'visited'
+    | 'visited-today'
+    | 'visited-week'
+    | 'visited-month'
+    | 'recent'
+    | 'trending'
+    | 'relevance'
+    | 'ranking'
+    | 'random'
+    | (string & {})
 
 export interface FetchOptions {
   /** API fields to request. Defaults to the fields needed by `DailymotionGallery`. */
@@ -62,7 +64,7 @@ export interface FetchOptions {
 export interface VideoQueryOptions extends FetchOptions {
   /** 1-based page number. Defaults to 1. */
   page?: number
-  /** Videos per page. Defaults to 8. */
+  /** Videos per page (1 to 100). Defaults to 8. */
   limit?: number
   /**
    * Sort order:
@@ -72,7 +74,7 @@ export interface VideoQueryOptions extends FetchOptions {
    * - `'visited-month'`: Most viewed this month
    * - `'recent'`: Most recent first
    * - `'trending'`: Currently trending
-   * - `'relevance'`: Search relevance
+   * - `'relevance'`: Search relevance (needs `search`)
    * - `'random'`: Random
    */
   sort?: DailymotionVideoSort
@@ -117,7 +119,7 @@ export interface DailymotionPlaylistInfo {
 export interface FetchPlaylistOptions extends FetchOptions {
   /** 1-based page number. Defaults to 1. */
   page?: number
-  /** Videos per page. Defaults to 8. */
+  /** Videos per page (1 to 100). Defaults to 8. */
   limit?: number
 }
 
@@ -128,40 +130,60 @@ export function clearApiCache(): void {
   responseCache.clear()
 }
 
+function clampLimit(limit: number): number {
+  if (!Number.isFinite(limit)) return 8
+  return Math.min(Math.max(1, Math.floor(limit)), MAX_LIMIT)
+}
+
 async function getJson<T>(path: string, { signal, cache = true }: FetchOptions = {}): Promise<T> {
   const url = `${API_BASE}/${path}`
   if (cache && responseCache.has(url)) return responseCache.get(url) as T
 
   const response = await fetch(url, { signal })
   if (!response.ok) {
-    throw new Error(`[Dailymotion API] Request failed with status ${response.status}`)
+    // Remonte le message de l'API (ex. "Invalid parameter...") au lieu du seul code HTTP
+    let detail = ''
+    try {
+      const body = (await response.json()) as { error?: { message?: string } }
+      if (body.error?.message) detail = `: ${body.error.message}`
+    } catch {
+      /* corps non JSON */
+    }
+    throw new Error(`[Dailymotion API] Request failed with status ${response.status}${detail}`)
   }
   const json = (await response.json()) as T
-  if (cache) responseCache.set(url, json)
+  if (cache) {
+    // Évite que le cache grossisse sans limite pendant une longue session
+    if (responseCache.size >= MAX_CACHE_ENTRIES) {
+      const oldest = responseCache.keys().next().value
+      if (oldest !== undefined) responseCache.delete(oldest)
+    }
+    responseCache.set(url, json)
+  }
   return json
 }
 
 /** Fetches one page of videos of a playlist from the public Dailymotion API. */
 export async function fetchPlaylistVideos(
-  playlistId: string,
-  { page = 1, limit = 8, fields = DEFAULT_VIDEO_FIELDS, signal, cache }: FetchPlaylistOptions = {},
+    playlistId: string,
+    { page = 1, limit = 8, fields = DEFAULT_VIDEO_FIELDS, signal, cache }: FetchPlaylistOptions = {},
 ): Promise<PlaylistPage> {
   const query = new URLSearchParams({
     fields: fields.join(','),
-    limit: String(limit),
+    limit: String(clampLimit(limit)),
     page: String(page),
   })
   const data = await getJson<Partial<PlaylistPage>>(
-    `playlist/${encodeURIComponent(playlistId)}/videos?${query.toString()}`,
-    { signal, cache },
+      `playlist/${encodeURIComponent(playlistId)}/videos?${query.toString()}`,
+      { signal, cache },
   )
   return { list: data.list ?? [], has_more: Boolean(data.has_more) }
 }
 
 /** Fetches a single video from the public Dailymotion API. */
 export async function fetchVideo(
-  videoId: string,
-  { fields = DEFAULT_VIDEO_FIELDS, signal, cache }: FetchOptions = {},
+    videoId: string,
+    { fields = DEFAULT_VIDEO_FIELDS, signal, cache }: FetchOptions = {},
 ): Promise<DailymotionVideo> {
   const query = new URLSearchParams({ fields: fields.join(',') })
   return getJson<DailymotionVideo>(`video/${encodeURIComponent(videoId)}?${query.toString()}`, {
@@ -172,80 +194,105 @@ export async function fetchVideo(
 
 /** Fetches a playlist (name, description...) from the public Dailymotion API. */
 export async function fetchPlaylist(
-  playlistId: string,
-  { fields = ['id', 'name', 'description'], signal, cache }: FetchOptions = {},
+    playlistId: string,
+    { fields = ['id', 'name', 'description'], signal, cache }: FetchOptions = {},
 ): Promise<DailymotionPlaylistInfo> {
   const query = new URLSearchParams({ fields: fields.join(',') })
   return getJson<DailymotionPlaylistInfo>(
-    `playlist/${encodeURIComponent(playlistId)}?${query.toString()}`,
-    { signal, cache },
+      `playlist/${encodeURIComponent(playlistId)}?${query.toString()}`,
+      { signal, cache },
   )
 }
 
 /**
- * Queries videos from the public Dailymotion API (`/videos`).
+ * Queries videos from the public Dailymotion API.
  * Supports sorting (e.g. most viewed `sort="visited"`), search, category, owner, tags, etc.
+ *
+ * With `owner`, the dedicated `/user/:id/videos` endpoint is used first (the owner is then
+ * in the path, not in the query string). If the API rejects it, the request is retried on
+ * `/videos?owner=...`.
  */
 export async function fetchVideos({
-  page = 1,
-  limit = 8,
-  fields = DEFAULT_VIDEO_FIELDS,
-  sort,
-  search,
-  channel,
-  owner,
-  tags,
-  country,
-  language,
-  createdAfter,
-  createdBefore,
-  longerThan,
-  shorterThan,
-  live,
-  verified,
-  explicit,
-  params,
-  signal,
-  cache,
-}: VideoQueryOptions = {}): Promise<VideosPage> {
-  const query = new URLSearchParams()
-  query.set('fields', fields.join(','))
-  query.set('limit', String(limit))
-  query.set('page', String(page))
+                                    page = 1,
+                                    limit = 8,
+                                    fields = DEFAULT_VIDEO_FIELDS,
+                                    sort,
+                                    search,
+                                    channel,
+                                    owner,
+                                    tags,
+                                    country,
+                                    language,
+                                    createdAfter,
+                                    createdBefore,
+                                    longerThan,
+                                    shorterThan,
+                                    live,
+                                    verified,
+                                    explicit,
+                                    params,
+                                    signal,
+                                    cache,
+                                  }: VideoQueryOptions = {}): Promise<VideosPage> {
+  const cleanOwner = owner?.trim()
+  const cleanSearch = search?.trim()
 
-  if (sort) query.set('sort', sort)
-  if (search) query.set('search', search)
-  if (channel) query.set('channel', channel)
-  if (owner) query.set('owner', owner)
-  if (tags) query.set('tags', Array.isArray(tags) ? tags.join(',') : tags)
-  if (country) query.set('country', country)
-  if (language) query.set('language', language)
-  if (createdAfter !== undefined) query.set('created_after', String(createdAfter))
-  if (createdBefore !== undefined) query.set('created_before', String(createdBefore))
-  if (longerThan !== undefined) query.set('longer_than', String(longerThan))
-  if (shorterThan !== undefined) query.set('shorter_than', String(shorterThan))
-  if (live !== undefined) query.set('live', live ? '1' : '0')
-  if (verified !== undefined) query.set('verified', verified ? '1' : '0')
-  if (explicit !== undefined) query.set('explicit', explicit ? '1' : '0')
+  const buildQuery = (withOwnerParam: boolean): string => {
+    const query = new URLSearchParams()
+    query.set('fields', fields.join(','))
+    query.set('limit', String(clampLimit(limit)))
+    query.set('page', String(page))
 
-  if (params) {
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null) {
-        query.set(key, String(value))
+    if (sort) query.set('sort', sort)
+    if (cleanSearch) query.set('search', cleanSearch)
+    if (channel) query.set('channel', channel)
+    if (cleanOwner && withOwnerParam) query.set('owner', cleanOwner)
+    if (tags && (!Array.isArray(tags) || tags.length)) {
+      query.set('tags', Array.isArray(tags) ? tags.join(',') : tags)
+    }
+    if (country) query.set('country', country)
+    if (language) query.set('language', language)
+    if (createdAfter !== undefined) query.set('created_after', String(createdAfter))
+    if (createdBefore !== undefined) query.set('created_before', String(createdBefore))
+    if (longerThan !== undefined) query.set('longer_than', String(longerThan))
+    if (shorterThan !== undefined) query.set('shorter_than', String(shorterThan))
+    if (live !== undefined) query.set('live', live ? '1' : '0')
+    if (verified !== undefined) query.set('verified', verified ? '1' : '0')
+    if (explicit !== undefined) query.set('explicit', explicit ? '1' : '0')
+
+    if (params) {
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) query.set(key, String(value))
       }
     }
+    return query.toString()
   }
 
-  const endpoint = owner ? `user/${encodeURIComponent(owner)}/videos` : 'videos'
-  const data = await getJson<Partial<VideosPage>>(`${endpoint}?${query.toString()}`, {
-    signal,
-    cache,
-  })
-
-  return {
-    list: data.list ?? [],
-    has_more: Boolean(data.has_more),
-    total: typeof data.total === 'number' ? data.total : undefined,
+  let data: Partial<VideosPage>
+  if (cleanOwner) {
+    try {
+      data = await getJson<Partial<VideosPage>>(
+          `user/${encodeURIComponent(cleanOwner)}/videos?${buildQuery(false)}`,
+          { signal, cache },
+      )
+    } catch (error) {
+      if (signal?.aborted) throw error
+      // Repli : certains filtres ne sont acceptés que par /videos
+      data = await getJson<Partial<VideosPage>>(`videos?${buildQuery(true)}`, { signal, cache })
+    }
+  } else {
+    data = await getJson<Partial<VideosPage>>(`videos?${buildQuery(false)}`, { signal, cache })
   }
+
+  const total = typeof data.total === 'number' ? data.total : undefined
+  const list = data.list ?? []
+  // Si l'API n'envoie pas has_more, on le déduit du total
+  const hasMore =
+      typeof data.has_more === 'boolean'
+          ? data.has_more
+          : total !== undefined
+              ? page * clampLimit(limit) < total
+              : false
+
+  return { list, has_more: hasMore, total }
 }
-

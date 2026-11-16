@@ -22,7 +22,7 @@ export interface UseVideosResult {
   total?: number
   /** Loads the next page. Resolves with the full, updated list of videos. */
   loadMore: () => Promise<DailymotionVideo[]>
-  /** Reloads the list from page 1. */
+  /** Reloads the list from page 1, bypassing the cache. */
   refresh: () => Promise<DailymotionVideo[]>
 }
 
@@ -120,32 +120,32 @@ export function useVideos(options: UseVideosOptions = {}): UseVideosResult {
   latestOptionsRef.current = options
 
   const fetchPage = useCallback(
-    async (pageNumber: number, signal?: AbortSignal) => {
-      const opts = latestOptionsRef.current
-      return fetchVideos({
-        page: pageNumber,
-        limit: opts.pageSize ?? 8,
-        fields: opts.fields,
-        sort: opts.sort,
-        search: opts.search,
-        channel: opts.channel,
-        owner: opts.owner,
-        tags: opts.tags,
-        country: opts.country,
-        language: opts.language,
-        createdAfter: opts.createdAfter,
-        createdBefore: opts.createdBefore,
-        longerThan: opts.longerThan,
-        shorterThan: opts.shorterThan,
-        live: opts.live,
-        verified: opts.verified,
-        explicit: opts.explicit,
-        params: opts.params,
-        cache: opts.cache,
-        signal,
-      })
-    },
-    [],
+      async (pageNumber: number, signal?: AbortSignal, forceFresh = false) => {
+        const opts = latestOptionsRef.current
+        return fetchVideos({
+          page: pageNumber,
+          limit: opts.pageSize ?? 8,
+          fields: opts.fields,
+          sort: opts.sort,
+          search: opts.search,
+          channel: opts.channel,
+          owner: opts.owner,
+          tags: opts.tags,
+          country: opts.country,
+          language: opts.language,
+          createdAfter: opts.createdAfter,
+          createdBefore: opts.createdBefore,
+          longerThan: opts.longerThan,
+          shorterThan: opts.shorterThan,
+          live: opts.live,
+          verified: opts.verified,
+          explicit: opts.explicit,
+          params: opts.params,
+          cache: forceFresh ? false : opts.cache,
+          signal,
+        })
+      },
+      [],
   )
 
   useEffect(() => {
@@ -161,23 +161,24 @@ export function useVideos(options: UseVideosOptions = {}): UseVideosResult {
     setState({ ...idleState, loading: true })
 
     fetchPage(1, controller.signal)
-      .then((page) => {
-        if (controller.signal.aborted) return
-        setState({
-          videos: mergeUnique([], page.list),
-          hasMore: page.has_more,
-          total: page.total,
-          loading: false,
-          loadingMore: false,
-          error: null,
+        .then((page) => {
+          if (controller.signal.aborted) return
+          setState({
+            videos: mergeUnique([], page.list),
+            hasMore: page.has_more,
+            total: page.total,
+            loading: false,
+            loadingMore: false,
+            error: null,
+          })
         })
-      })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted) return
-        setState({ ...idleState, error: toError(error) })
-      })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) return
+          setState({ ...idleState, error: toError(error) })
+        })
 
-    return () => controller.abort()
+    // Annule la requête en cours, y compris celle lancée par refresh()
+    return () => controllerRef.current?.abort()
   }, [queryKey, enabled, fetchPage])
 
   const loadMore = useCallback(async (): Promise<DailymotionVideo[]> => {
@@ -220,24 +221,33 @@ export function useVideos(options: UseVideosOptions = {}): UseVideosResult {
   }, [enabled, fetchPage])
 
   const refresh = useCallback(async (): Promise<DailymotionVideo[]> => {
+    // Remplace le contrôleur courant pour que loadMore() reste utilisable après un refresh
+    controllerRef.current?.abort()
+    const controller = new AbortController()
+    controllerRef.current = controller
     pageRef.current = 1
     loadingMoreRef.current = false
-    setState((prev) => ({ ...prev, loading: true, error: null }))
+    setState((prev) => ({ ...prev, loading: true, loadingMore: false, error: null }))
     try {
-      const page = await fetchPage(1)
+      // forceFresh : sans cela, le cache renverrait la même réponse et rien ne se rafraîchirait
+      const page = await fetchPage(1, controller.signal, true)
       const fresh = mergeUnique([], page.list)
-      setState({
-        videos: fresh,
-        hasMore: page.has_more,
-        total: page.total,
-        loading: false,
-        loadingMore: false,
-        error: null,
-      })
+      if (!controller.signal.aborted) {
+        setState({
+          videos: fresh,
+          hasMore: page.has_more,
+          total: page.total,
+          loading: false,
+          loadingMore: false,
+          error: null,
+        })
+      }
       return fresh
     } catch (error: unknown) {
       const err = toError(error)
-      setState((prev) => ({ ...prev, loading: false, error: err }))
+      if (!controller.signal.aborted) {
+        setState((prev) => ({ ...prev, loading: false, error: err }))
+      }
       throw err
     }
   }, [fetchPage])
